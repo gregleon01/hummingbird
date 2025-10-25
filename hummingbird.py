@@ -299,9 +299,14 @@ class GlowCanvas(QWidget):
 
     def paintEvent(self, event):  # noqa: N802
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.HighQualityAntialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        for hint_name in (
+            "Antialiasing",
+            "HighQualityAntialiasing",
+            "SmoothPixmapTransform",
+        ):
+            hint = getattr(QPainter.RenderHint, hint_name, None)
+            if hint is not None:
+                painter.setRenderHint(hint)
         painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
 
         rect = self.rect().adjusted(18, 18, -18, -18)
@@ -359,13 +364,7 @@ class VoiceOverlay(QWidget):
         self._drag_offset = QPointF(0, 0)
         self._drag_active = False
 
-        self._build_ui()
-        self._configure_window()
-        self._setup_timers()
-        self._install_hotkey()
-
-    def _configure_window(self):
-        self._font_family = resolve_font_family(
+        self._font_family: str = resolve_font_family(
             primary="SF Pro Rounded",
             fallbacks=(
                 "SF Pro Display",
@@ -377,6 +376,13 @@ class VoiceOverlay(QWidget):
                 "SFMono-Regular",
             ),
         )
+
+        self._build_ui()
+        self._configure_window()
+        self._setup_timers()
+        self._install_hotkey()
+
+    def _configure_window(self):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -452,7 +458,7 @@ class VoiceOverlay(QWidget):
         if self.rect().isNull():
             return
         path = QPainterPath()
-        path.addRoundedRect(self.rect(), 28, 28)
+        path.addRoundedRect(QRectF(self.rect()), 28, 28)
         region = QRegion(path.toFillPolygon().toPolygon())
         self.setMask(region)
 
