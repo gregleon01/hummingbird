@@ -299,9 +299,14 @@ class GlowCanvas(QWidget):
 
     def paintEvent(self, event):  # noqa: N802
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.HighQualityAntialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        for hint_name in (
+            "Antialiasing",
+            "HighQualityAntialiasing",
+            "SmoothPixmapTransform",
+        ):
+            hint = getattr(QPainter.RenderHint, hint_name, None)
+            if hint is not None:
+                painter.setRenderHint(hint)
         painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
 
         rect = self.rect().adjusted(18, 18, -18, -18)
