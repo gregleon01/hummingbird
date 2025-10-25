@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -28,6 +29,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QHBoxLayout,
     QGraphicsDropShadowEffect,
+    QComboBox,
+    QPlainTextEdit,
 )
 
 try:
@@ -43,6 +46,58 @@ except ImportError as exc:  # pragma: no cover - pyobjc missing
 OPTION_MASK = CG.kCGEventFlagMaskAlternate
 CONTROL_MASK = CG.kCGEventFlagMaskControl
 KEYCODE_M = 46  # macOS virtual keycode for the 'M' key
+
+
+class SummaryGenerator:
+    """Lazy text summariser powered by a small transformers model."""
+
+    PROMPTS: Dict[str, str] = {
+        "coding": (
+            "You rewrite transcripts into concise programming direction. "
+            "Return bullet points with requirements, APIs, assumptions, and next actions. "
+            "Transcript:\n{transcript}\n\nCoding summary:"
+        ),
+        "personal": (
+            "You are an empathetic editor. Clean up grammar and punctuation while keeping the voice first-person. "
+            "Transcript:\n{transcript}\n\nPolished version:"
+        ),
+        "meetings": (
+            "You are a chief of staff capturing a meeting. Use headings for Key Decisions, Action Items, Deadlines, "
+            "Notable Quotes, and Other Notes. If a section is empty, write 'None'. Prioritise urgent items first. "
+            "Transcript:\n{transcript}\n\nStructured meeting report:"
+        ),
+    }
+
+    def __init__(self, model_name: Optional[str] = None):
+        if model_name is None:
+            model_name = os.getenv("HUMMINGBIRD_SUMMARY_MODEL", "google/flan-t5-small")
+        self.model_name = model_name
+        self._pipeline = None
+        self._lock = threading.Lock()
+
+    def _load_pipeline(self):
+        with self._lock:
+            if self._pipeline is None:
+                from transformers import pipeline
+
+                self._pipeline = pipeline("text2text-generation", model=self.model_name)
+        return self._pipeline
+
+    def generate(self, transcript: str, focus: str) -> str:
+        if not transcript.strip():
+            return ""
+        prompt = self.PROMPTS.get(focus)
+        if prompt is None:
+            raise ValueError(f"Unknown summary focus: {focus}")
+        generator = self._load_pipeline()
+        result = generator(
+            prompt.format(transcript=transcript.strip()),
+            max_length=512,
+            num_beams=4,
+        )
+        if not result:
+            return ""
+        return result[0]["generated_text"].strip()
 
 
 def is_accessibility_granted() -> bool:
@@ -199,6 +254,10 @@ class VoiceOverlay(QWidget):
         self.recording = False
         self.transcribing = False
         self.last_transcript = ""
+        self.summary_generator: Optional[SummaryGenerator] = None
+        self.summary_results: Dict[str, str] = {}
+        self.summarizing_focus: Optional[str] = None
+        self.summarizing = False
         self._drag_offset = QPointF(0, 0)
         self._drag_active = False
 
@@ -225,6 +284,30 @@ class VoiceOverlay(QWidget):
             }
             QLabel {
                 color: rgba(224, 231, 255, 0.88);
+            }
+            QComboBox {
+                background: rgba(17, 24, 39, 0.92);
+                color: #f8fafc;
+                border: 1px solid rgba(94, 104, 128, 0.32);
+                border-radius: 14px;
+                padding: 8px 16px;
+                font-family: "Rubik Mono";
+                font-size: 11px;
+            }
+            QComboBox QAbstractItemView {
+                background: rgba(15, 23, 42, 0.98);
+                border-radius: 12px;
+                selection-background-color: rgba(59, 130, 246, 0.28);
+                selection-color: #f8fafc;
+            }
+            QPlainTextEdit {
+                background: rgba(8, 11, 18, 0.76);
+                border: 1px solid rgba(94, 104, 128, 0.22);
+                border-radius: 20px;
+                color: rgba(226, 232, 240, 0.94);
+                padding: 16px;
+                font-family: "Rubik Mono";
+                font-size: 11px;
             }
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -283,18 +366,39 @@ class VoiceOverlay(QWidget):
         control_row = QHBoxLayout()
         control_row.setContentsMargins(0, 0, 0, 0)
 
-        self.copy_button = QPushButton("Copy")
+        self.summary_selector = QComboBox()
+        self.summary_selector.addItem("Select summary focus…", userData=None)
+        self.summary_selector.addItem("Coding", userData="coding")
+        self.summary_selector.addItem("Personal", userData="personal")
+        self.summary_selector.addItem("Meetings", userData="meetings")
+        self.summary_selector.setEnabled(False)
+        self.summary_selector.currentIndexChanged.connect(self._update_summary_display)  # type: ignore[arg-type]
+
+        self.summary_output = QPlainTextEdit()
+        self.summary_output.setReadOnly(True)
+        self.summary_output.setPlainText("Summaries appear here once generated.")
+
+        self.copy_button = QPushButton("Copy Transcript")
         self.copy_button.setEnabled(False)
         copy_font = QFont(font_family, 12, QFont.Weight.Medium)
         self.copy_button.setFont(copy_font)
         self.copy_button.clicked.connect(self._copy_transcript)  # type: ignore[arg-type]
 
+        self.summary_copy_button = QPushButton("Copy Summary")
+        self.summary_copy_button.setEnabled(False)
+        summary_copy_font = QFont(font_family, 12, QFont.Weight.Medium)
+        self.summary_copy_button.setFont(summary_copy_font)
+        self.summary_copy_button.clicked.connect(self._copy_summary)  # type: ignore[arg-type]
+
         control_row.addStretch()
         control_row.addWidget(self.copy_button)
+        control_row.addWidget(self.summary_copy_button)
         control_row.addStretch()
 
         container_layout.addWidget(self.glow, alignment=Qt.AlignmentFlag.AlignCenter)
         container_layout.addWidget(self.status)
+        container_layout.addWidget(self.summary_selector)
+        container_layout.addWidget(self.summary_output)
         container_layout.addLayout(control_row)
 
         root_layout.addWidget(container)
@@ -373,6 +477,13 @@ class VoiceOverlay(QWidget):
 
         self.recording = True
         self.copy_button.setEnabled(False)
+        self.summary_copy_button.setEnabled(False)
+        self.summary_selector.setCurrentIndex(0)
+        self.summary_selector.setEnabled(False)
+        self.summary_results.clear()
+        self.summarizing = False
+        self.summarizing_focus = None
+        self.summary_output.setPlainText("Summaries appear here once generated.")
         self.glow.set_recording(True)
         self._set_status("Listening… tap again to finish")
 
@@ -478,7 +589,18 @@ class VoiceOverlay(QWidget):
         def update():
             self.transcribing = False
             self.last_transcript = text
+            self.summarizing = False
+            self.summarizing_focus = None
+            self.summary_results.clear()
             self.copy_button.setEnabled(bool(text))
+            self.summary_selector.setEnabled(bool(text))
+            if bool(text):
+                self.summary_selector.setCurrentIndex(0)
+                self.summary_output.setPlainText("Pick a focus from the menu to generate a summary.")
+                self.summary_copy_button.setEnabled(False)
+            if not text:
+                self.summary_output.setPlainText("Summaries appear here once generated.")
+                self.summary_copy_button.setEnabled(False)
             self._set_status(status)
         QApplication.instance().postEvent(self, _ToggleEvent(update))
 
@@ -488,6 +610,54 @@ class VoiceOverlay(QWidget):
         QApplication.clipboard().setText(self.last_transcript)
         self.copy_button.setEnabled(False)
         self._set_status("Copied to clipboard")
+
+    def _copy_summary(self):
+        focus = self.summary_selector.currentData()
+        if not focus:
+            return
+        summary = self.summary_results.get(focus)
+        if not summary:
+            return
+        QApplication.clipboard().setText(summary)
+        self.summary_copy_button.setEnabled(False)
+        self._set_status("Summary copied to clipboard")
+
+    def _start_summary_generation(self, focus: str):
+        if not self.last_transcript:
+            return
+        if self.summarizing and self.summarizing_focus == focus:
+            return
+        self.summarizing = True
+        self.summarizing_focus = focus
+        self.summary_copy_button.setEnabled(False)
+        self._set_status(f"Generating {focus} summary…")
+
+        def worker():
+            if self.summary_generator is None:
+                self.summary_generator = SummaryGenerator()
+            try:
+                summary_text = self.summary_generator.generate(self.last_transcript, focus)
+                message = f"{focus.title()} summary ready"
+            except Exception as exc:
+                summary_text = ""
+                message = f"Summary error: {exc}"
+
+            def apply():
+                self.summarizing = False
+                if summary_text:
+                    self.summary_results[focus] = summary_text
+                    if self.summary_selector.currentData() == focus:
+                        self.summary_output.setPlainText(summary_text)
+                        self.summary_copy_button.setEnabled(True)
+                else:
+                    if self.summary_selector.currentData() == focus:
+                        self.summary_output.setPlainText("Failed to generate summary.")
+                        self.summary_copy_button.setEnabled(False)
+                self._set_status(message)
+
+            QApplication.instance().postEvent(self, _ToggleEvent(apply))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _set_status(self, message: str):
         self.status.setText(message)
@@ -515,7 +685,14 @@ class VoiceOverlay(QWidget):
 
     def _hit_interactive_child(self, pos):
         child = self.container.childAt(pos)
-        return child in {self.glow, self.copy_button}
+        return child in {
+            self.glow,
+            self.copy_button,
+            self.summary_copy_button,
+            self.summary_selector,
+            self.summary_output,
+            self.summary_output.viewport(),
+        }
 
     def closeEvent(self, event):  # noqa: N802
         if self.stream is not None:
@@ -534,6 +711,25 @@ class VoiceOverlay(QWidget):
             event.invoke()
             return True
         return super().event(event)
+
+    def _update_summary_display(self, _index: int = 0):
+        focus = self.summary_selector.currentData()
+        if not focus:
+            self.summary_output.setPlainText("Summaries appear here once generated.")
+            self.summary_copy_button.setEnabled(False)
+            return
+        if not self.last_transcript:
+            self.summary_output.setPlainText("Record something to generate a summary.")
+            self.summary_copy_button.setEnabled(False)
+            return
+        summary = self.summary_results.get(focus)
+        if summary:
+            self.summary_output.setPlainText(summary)
+            self.summary_copy_button.setEnabled(True)
+            self._set_status(f"{focus.title()} summary ready")
+        else:
+            self.summary_output.setPlainText("Generating summary…")
+            self._start_summary_generation(focus)
 
 
 class _ToggleEvent(QEvent):
