@@ -453,7 +453,7 @@ class VoiceOverlay(QWidget):
         if self.rect().isNull():
             return
         path = QPainterPath()
-        path.addRoundedRect(self.rect(), 28, 28)
+        path.addRoundedRect(QRectF(self.rect()), 28, 28)
         region = QRegion(path.toFillPolygon().toPolygon())
         self.setMask(region)
 
