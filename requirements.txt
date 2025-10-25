@@ -1,0 +1,6 @@
+PyQt6
+sounddevice
+soundfile
+numpy
+openai-whisper
+pyobjc

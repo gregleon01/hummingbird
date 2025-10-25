@@ -1,0 +1,14 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+
+# macOS noise
+.DS_Store
+
+# Virtual environments
+venv/
+.env/
+
+# Whisper caches
+*.log
+.whisper*
