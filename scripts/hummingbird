@@ -1,13 +1,36 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="${VENV:-$HOME/voice-overlay-venv}"
+VENV="${VENV:-}"
 
-if [[ ! -d "$VENV" ]]; then
-  echo "voice-overlay-venv not found at $VENV" >&2
+declare -a CANDIDATES
+
+if [[ -n "$VENV" ]]; then
+  CANDIDATES+=("$VENV")
+fi
+
+CANDIDATES+=(
+  "$ROOT_DIR/.venv"
+  "$ROOT_DIR/venv"
+  "$HOME/voice-overlay-venv"
+)
+
+SELECTED=""
+for candidate in "${CANDIDATES[@]}"; do
+  if [[ -d "$candidate" && -f "$candidate/bin/activate" ]]; then
+    SELECTED="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$SELECTED" ]]; then
+  echo "Unable to locate a virtual environment." >&2
+  echo "Checked the following locations:" >&2
+  printf '  - %s\n' "${CANDIDATES[@]}" >&2
+  echo "Set the VENV environment variable to the desired path before running this script." >&2
   exit 1
 fi
 
-source "$VENV/bin/activate"
+source "$SELECTED/bin/activate"
 python "$ROOT_DIR/hummingbird.py" --model base "$@"
