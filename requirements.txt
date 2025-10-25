@@ -1,6 +1,8 @@
-PyQt6
-sounddevice
-soundfile
 numpy
 openai-whisper
+PyQt6
 pyobjc
+sentencepiece
+sounddevice
+soundfile
+transformers
