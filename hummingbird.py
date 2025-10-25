@@ -6,6 +6,7 @@ the user presses the copy button.
 """
 import argparse
 import math
+import os
 import queue
 import sys
 import tempfile
@@ -192,7 +193,8 @@ class VoiceOverlay(QWidget):
         self.samplerate = samplerate
         self.model = None
         self.stream = None
-        self.audio_frames = []
+        self._audio_writer = None
+        self._recording_path = None
         self.level_queue = queue.Queue(maxsize=5)
         self.recording = False
         self.transcribing = False
@@ -336,6 +338,27 @@ class VoiceOverlay(QWidget):
             self._stop_recording()
 
     def _start_recording(self):
+        while not self.level_queue.empty():
+            try:
+                self.level_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        try:
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            self._recording_path = Path(path)
+            self._audio_writer = sf.SoundFile(
+                self._recording_path,
+                mode="w",
+                samplerate=self.samplerate,
+                channels=1,
+            )
+        except Exception as exc:
+            self._set_status(f"File error: {exc}")
+            self._cleanup_recording_file(remove=True)
+            return
+
         try:
             self.stream = sd.InputStream(
                 samplerate=self.samplerate,
@@ -345,10 +368,10 @@ class VoiceOverlay(QWidget):
             self.stream.start()
         except Exception as exc:
             self._set_status(f"Mic error: {exc}")
+            self._cleanup_recording_file(remove=True)
             return
 
         self.recording = True
-        self.audio_frames = []
         self.copy_button.setEnabled(False)
         self.glow.set_recording(True)
         self._set_status("Listening… tap again to finish")
@@ -363,22 +386,29 @@ class VoiceOverlay(QWidget):
         finally:
             self.stream = None
 
+        recording_path = self._recording_path
+        self._recording_path = None
+        self._close_writer()
+
         self.glow.set_recording(False)
         self.glow.set_level(0.0)
         self.transcribing = True
         self._set_status("Transcribing…")
 
-        frames = self.audio_frames.copy()
         threading.Thread(
-            target=self._transcribe_frames,
-            args=(frames,),
+            target=self._transcribe_file,
+            args=(recording_path,),
             daemon=True,
         ).start()
 
     def _audio_callback(self, indata, _frames, _time, _status):
         if not self.recording:
             return
-        self.audio_frames.append(indata.copy())
+        if self._audio_writer is not None:
+            try:
+                self._audio_writer.write(indata)
+            except Exception as exc:
+                print(f"File write error: {exc}", file=sys.stderr)
         rms = float(np.sqrt(np.mean(np.square(indata))))
         level = min(1.0, rms * 12.0)
         try:
@@ -396,15 +426,12 @@ class VoiceOverlay(QWidget):
         smoothed = 0.7 * self.glow.level + 0.3 * level
         self.glow.set_level(smoothed)
 
-    def _transcribe_frames(self, frames):
-        if not frames:
-            self._finish_transcription("", "No audio detected")
-            return
-
-        audio = np.concatenate(frames, axis=0).flatten()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            wav_path = Path(tmpdir) / "clip.wav"
-            sf.write(wav_path, audio, self.samplerate)
+    def _transcribe_file(self, path):
+        try:
+            wav_path = Path(path) if path is not None else None
+            if wav_path is None or not wav_path.exists() or wav_path.stat().st_size == 0:
+                self._finish_transcription("", "No audio detected")
+                return
 
             try:
                 if self.model is None:
@@ -418,6 +445,34 @@ class VoiceOverlay(QWidget):
                     self._finish_transcription(transcript, "Transcript ready — press Copy")
             except Exception as exc:
                 self._finish_transcription("", f"Whisper error: {exc}")
+        finally:
+            self._cleanup_recording_file(path=path, remove=True)
+
+    def _close_writer(self):
+        if self._audio_writer is not None:
+            try:
+                self._audio_writer.flush()
+            except Exception:
+                pass
+            try:
+                self._audio_writer.close()
+            except Exception:
+                pass
+            self._audio_writer = None
+
+    def _cleanup_recording_file(self, path=None, remove=False):
+        if path is None:
+            path = self._recording_path
+        self._close_writer()
+        if remove and path is not None:
+            try:
+                Path(path).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"Failed to delete temp file {path}: {exc}", file=sys.stderr)
+        if path is self._recording_path:
+            self._recording_path = None
 
     def _finish_transcription(self, text: str, status: str):
         def update():
@@ -469,6 +524,7 @@ class VoiceOverlay(QWidget):
                 self.stream.close()
             except sd.PortAudioError:
                 pass
+        self._cleanup_recording_file(remove=True)
         if hasattr(self, "hotkey"):
             self.hotkey.stop()
         super().closeEvent(event)
