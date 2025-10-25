@@ -8,6 +8,7 @@ import argparse
 import math
 import os
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -19,8 +20,17 @@ import sounddevice as sd
 import soundfile as sf
 import whisper
 
-from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPointF
-from PyQt6.QtGui import QColor, QPainter, QRadialGradient, QFont, QFontDatabase, QBrush
+from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QPointF, QRectF
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QFontDatabase,
+    QPainter,
+    QPainterPath,
+    QRadialGradient,
+    QRegion,
+    QBrush,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -74,14 +84,25 @@ class SummaryGenerator:
         self.model_name = model_name
         self._pipeline = None
         self._lock = threading.Lock()
+        self._using_fallback = False
 
     def _load_pipeline(self):
         with self._lock:
             if self._pipeline is None:
-                from transformers import pipeline
-
+                try:
+                    from transformers import pipeline
+                except ModuleNotFoundError:
+                    self._pipeline = False
+                    self._using_fallback = True
+                    return None
                 self._pipeline = pipeline("text2text-generation", model=self.model_name)
+        if self._pipeline is False:
+            return None
         return self._pipeline
+
+    @property
+    def using_fallback(self) -> bool:
+        return self._using_fallback
 
     def generate(self, transcript: str, focus: str) -> str:
         if not transcript.strip():
@@ -90,6 +111,10 @@ class SummaryGenerator:
         if prompt is None:
             raise ValueError(f"Unknown summary focus: {focus}")
         generator = self._load_pipeline()
+        if generator is None:
+            self._using_fallback = True
+            return self._fallback_summary(transcript, focus)
+        self._using_fallback = False
         result = generator(
             prompt.format(transcript=transcript.strip()),
             max_length=512,
@@ -98,6 +123,66 @@ class SummaryGenerator:
         if not result:
             return ""
         return result[0]["generated_text"].strip()
+
+    def _fallback_summary(self, transcript: str, focus: str) -> str:
+        sentences = [
+            chunk.strip()
+            for chunk in re.split(r"(?<=[.!?])\s+", transcript.strip())
+            if chunk.strip()
+        ]
+        if focus == "coding":
+            bullets = []
+            for sentence in sentences:
+                cleaned = " ".join(sentence.split())
+                if not cleaned:
+                    continue
+                if len(cleaned) > 140:
+                    cleaned = cleaned[:137].rstrip() + "…"
+                bullets.append(f"• {cleaned}")
+                if len(bullets) >= 6:
+                    break
+            if not bullets:
+                bullets = ["• Clarify the goal and restate the main steps."]
+            return "\n".join(bullets)
+
+        if focus == "personal":
+            text = " ".join(transcript.split())
+            if not text.endswith(('.', '!', '?')):
+                text += "."
+            return text
+
+        if focus == "meetings":
+            sections = {
+                "Key Decisions": [],
+                "Action Items": [],
+                "Deadlines": [],
+                "Notable Quotes": [],
+                "Other Notes": [],
+            }
+            for sentence in sentences:
+                lower = sentence.lower()
+                target = "Other Notes"
+                if any(keyword in lower for keyword in ("decide", "agreement", "approved")):
+                    target = "Key Decisions"
+                elif any(keyword in lower for keyword in ("todo", "action", "follow up", "follow-up")):
+                    target = "Action Items"
+                elif any(keyword in lower for keyword in ("due", "deadline", "by ")):
+                    target = "Deadlines"
+                elif any(quote in lower for quote in ("said", "stated", "noted")):
+                    target = "Notable Quotes"
+                sections[target].append(sentence.strip())
+            lines = []
+            for heading, items in sections.items():
+                lines.append(f"{heading}:")
+                if items:
+                    for item in items[:5]:
+                        lines.append(f"- {item}")
+                else:
+                    lines.append("- None")
+                lines.append("")
+            return "\n".join(lines).strip()
+
+        return transcript.strip()
 
 
 def is_accessibility_granted() -> bool:
@@ -178,7 +263,10 @@ def mix_colors(cold: QColor, hot: QColor, amount: float) -> QColor:
     return QColor(r, g, b)
 
 
-def resolve_font_family(primary="Rubik Mono", fallbacks=("Menlo", "SFMono-Regular")):
+def resolve_font_family(
+    primary: str = "SF Pro Rounded",
+    fallbacks=("SF Pro Display", "Avenir Next", "Inter", "Helvetica Neue", "Rubik", "Menlo", "SFMono-Regular"),
+):
     families = set(QFontDatabase.families())
     if primary in families:
         return primary
@@ -194,7 +282,8 @@ class GlowCanvas(QWidget):
         super().__init__(parent)
         self._level = 0.0
         self._recording = False
-        self.setMinimumSize(QSize(300, 300))
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMinimumSize(QSize(320, 320))
 
     @property
     def level(self):
@@ -211,34 +300,43 @@ class GlowCanvas(QWidget):
     def paintEvent(self, event):  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.HighQualityAntialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
 
-        rect = self.rect()
+        rect = self.rect().adjusted(18, 18, -18, -18)
         center = rect.center()
-        radius = min(rect.width(), rect.height()) * 0.28
+        base_radius = min(rect.width(), rect.height()) * 0.3
 
         cold = QColor(31, 64, 104)
         hot = QColor(255, 99, 71)
-        accent = mix_colors(cold, hot, self._level ** 0.8)
+        accent = mix_colors(cold, hot, self._level ** 0.82)
 
-        diagonal = math.hypot(rect.width(), rect.height())
-        glow_radius = (diagonal * 0.55) + (diagonal * 0.25 * self._level)
-        gradient = QRadialGradient(center.x(), center.y(), glow_radius)
-        gradient.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), 185))
-        gradient.setColorAt(0.18, QColor(accent.red(), accent.green(), accent.blue(), 105))
-        gradient.setColorAt(0.45, QColor(54, 62, 88, 38))
-        gradient.setColorAt(0.78, QColor(20, 24, 34, 12))
-        gradient.setColorAt(1.0, QColor(8, 9, 12, 0))
+        glow_radius = min(rect.width(), rect.height()) * (0.6 + 0.28 * self._level)
+        gradient = QRadialGradient(center, glow_radius)
+        gradient.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), 205))
+        gradient.setColorAt(0.16, QColor(accent.red(), accent.green(), accent.blue(), 140))
+        gradient.setColorAt(0.38, QColor(accent.red(), accent.green(), accent.blue(), 80))
+        gradient.setColorAt(0.7, QColor(32, 40, 66, 28))
+        gradient.setColorAt(0.92, QColor(12, 16, 26, 10))
+        gradient.setColorAt(1.0, QColor(12, 16, 26, 0))
+
         painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(gradient))
-        painter.drawRect(rect)
+        glow_rect = QRectF(
+            center.x() - glow_radius,
+            center.y() - glow_radius,
+            glow_radius * 2,
+            glow_radius * 2,
+        )
+        painter.drawEllipse(glow_rect)
         painter.restore()
 
         core_color = accent if self._recording else QColor(22, 28, 43)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(core_color)
-        painter.drawEllipse(QPointF(center), radius, radius)
+        painter.drawEllipse(QPointF(center), base_radius, base_radius)
 
 
 class VoiceOverlay(QWidget):
@@ -267,6 +365,18 @@ class VoiceOverlay(QWidget):
         self._install_hotkey()
 
     def _configure_window(self):
+        self._font_family = resolve_font_family(
+            primary="SF Pro Rounded",
+            fallbacks=(
+                "SF Pro Display",
+                "Avenir Next",
+                "Inter",
+                "Helvetica Neue",
+                "Rubik",
+                "Menlo",
+                "SFMono-Regular",
+            ),
+        )
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -276,62 +386,75 @@ class VoiceOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setStyleSheet(
-            """
-            QWidget#container {
-                background: rgba(12, 16, 26, 0.82);
-                border-radius: 32px;
+            f"""
+            QWidget#container {{
+                background: rgba(12, 16, 26, 0.88);
+                border-radius: 28px;
                 border: 1px solid rgba(94, 104, 128, 0.22);
-            }
-            QLabel {
-                color: rgba(224, 231, 255, 0.88);
-            }
-            QComboBox {
-                background: rgba(17, 24, 39, 0.92);
+            }}
+            QLabel {{
+                color: rgba(224, 231, 255, 0.9);
+                font-family: "{self._font_family}";
+                letter-spacing: 0.2px;
+            }}
+            QComboBox {{
+                background: rgba(17, 24, 39, 0.94);
                 color: #f8fafc;
                 border: 1px solid rgba(94, 104, 128, 0.32);
-                border-radius: 14px;
-                padding: 8px 16px;
-                font-family: "Rubik Mono";
-                font-size: 11px;
-            }
-            QComboBox QAbstractItemView {
+                border-radius: 16px;
+                padding: 9px 18px;
+                font-family: "{self._font_family}";
+                font-size: 12px;
+            }}
+            QComboBox QAbstractItemView {{
                 background: rgba(15, 23, 42, 0.98);
-                border-radius: 12px;
+                border-radius: 14px;
                 selection-background-color: rgba(59, 130, 246, 0.28);
                 selection-color: #f8fafc;
-            }
-            QPlainTextEdit {
-                background: rgba(8, 11, 18, 0.76);
+                font-family: "{self._font_family}";
+            }}
+            QPlainTextEdit {{
+                background: rgba(8, 11, 18, 0.8);
                 border: 1px solid rgba(94, 104, 128, 0.22);
-                border-radius: 20px;
+                border-radius: 22px;
                 color: rgba(226, 232, 240, 0.94);
-                padding: 16px;
-                font-family: "Rubik Mono";
-                font-size: 11px;
-            }
-            QPushButton {
+                padding: 18px;
+                font-family: "{self._font_family}";
+                font-size: 12px;
+                line-height: 1.4em;
+            }}
+            QPushButton {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                            stop:0 rgba(21, 32, 52, 0.95),
-                                            stop:1 rgba(16, 23, 38, 0.95));
+                                            stop:0 rgba(30, 44, 71, 0.98),
+                                            stop:1 rgba(18, 27, 45, 0.98));
                 color: #f8fafc;
-                border-radius: 18px;
-                padding: 12px 36px;
-                font-family: "Rubik Mono";
+                border-radius: 20px;
+                padding: 13px 38px;
+                font-family: "{self._font_family}";
                 font-weight: 600;
-                letter-spacing: 0.7px;
-            }
-            QPushButton:hover {
-                background: rgba(34, 45, 70, 0.95);
-            }
-            QPushButton:pressed {
-                background: rgba(14, 21, 35, 0.98);
-            }
-            QPushButton:disabled {
+                letter-spacing: 0.8px;
+            }}
+            QPushButton:hover {{
+                background: rgba(43, 58, 90, 0.98);
+            }}
+            QPushButton:pressed {{
+                background: rgba(20, 26, 42, 1.0);
+            }}
+            QPushButton:disabled {{
                 background: rgba(30, 41, 59, 0.6);
                 color: rgba(248, 250, 252, 0.45);
-            }
+            }}
         """
         )
+        self._update_mask()
+
+    def _update_mask(self):
+        if self.rect().isNull():
+            return
+        path = QPainterPath()
+        path.addRoundedRect(self.rect(), 28, 28)
+        region = QRegion(path.toFillPolygon().toPolygon())
+        self.setMask(region)
 
     def _build_ui(self):
         root_layout = QVBoxLayout(self)
@@ -355,7 +478,7 @@ class VoiceOverlay(QWidget):
         self.glow.setCursor(Qt.CursorShape.PointingHandCursor)
         self.glow.mousePressEvent = self._handle_click  # type: ignore[method-assign]
 
-        font_family = resolve_font_family()
+        font_family = self._font_family
 
         self.status = QLabel("Control+Option+M to summon • Tap the orb to capture a thought")
         self.status.setWordWrap(True)
@@ -637,7 +760,12 @@ class VoiceOverlay(QWidget):
                 self.summary_generator = SummaryGenerator()
             try:
                 summary_text = self.summary_generator.generate(self.last_transcript, focus)
-                message = f"{focus.title()} summary ready"
+                if self.summary_generator.using_fallback:
+                    message = (
+                        f"{focus.title()} summary ready (basic mode — install 'transformers' for advanced results)"
+                    )
+                else:
+                    message = f"{focus.title()} summary ready"
             except Exception as exc:
                 summary_text = ""
                 message = f"Summary error: {exc}"
@@ -711,6 +839,10 @@ class VoiceOverlay(QWidget):
             event.invoke()
             return True
         return super().event(event)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._update_mask()
 
     def _update_summary_display(self, _index: int = 0):
         focus = self.summary_selector.currentData()
