@@ -359,12 +359,6 @@ class VoiceOverlay(QWidget):
         self._drag_offset = QPointF(0, 0)
         self._drag_active = False
 
-        self._build_ui()
-        self._configure_window()
-        self._setup_timers()
-        self._install_hotkey()
-
-    def _configure_window(self):
         self._font_family = resolve_font_family(
             primary="SF Pro Rounded",
             fallbacks=(
@@ -377,6 +371,26 @@ class VoiceOverlay(QWidget):
                 "SFMono-Regular",
             ),
         )
+
+        self._build_ui()
+        self._configure_window()
+        self._setup_timers()
+        self._install_hotkey()
+
+    def _configure_window(self):
+        if not hasattr(self, "_font_family"):
+            self._font_family = resolve_font_family(
+                primary="SF Pro Rounded",
+                fallbacks=(
+                    "SF Pro Display",
+                    "Avenir Next",
+                    "Inter",
+                    "Helvetica Neue",
+                    "Rubik",
+                    "Menlo",
+                    "SFMono-Regular",
+                ),
+            )
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
